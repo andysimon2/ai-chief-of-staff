@@ -1,0 +1,37 @@
+name: Daily Brief
+
+on:
+  schedule:
+    - cron: '0 12 * * 1-5'  # 7am EST weekdays (12pm UTC)
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  generate-brief:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      
+      - name: Install dependencies
+        run: |
+          pip install google-api-python-client google-auth anthropic python-dotenv
+      
+      - name: Create credentials file
+        run: |
+          mkdir -p credentials
+          echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > credentials/service-account.json
+      
+      - name: Create .env file
+        run: |
+          echo "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID }}" > .env
+          echo "SERVICE_ACCOUNT_FILE=credentials/service-account.json" >> .env
+          echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}" >> .env
+      
+      - name: Generate Daily Brief
+        run: python3 scripts/daily_brief.py
