@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Daily Brief Generator
-Reads tasks from Google Sheets and generates a morning brief
+Daily Brief Generator with Email Delivery
+Reads tasks from Google Sheets and emails daily brief
 """
 
 import os
 import sys
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from dotenv import load_dotenv
 from google.oauth2 import service_account
@@ -17,6 +20,8 @@ load_dotenv()
 # Configuration
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE')
+GMAIL_ADDRESS = os.getenv('GMAIL_ADDRESS')
+GMAIL_APP_PASSWORD = os.getenv('GMAIL_APP_PASSWORD')
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 
@@ -33,15 +38,13 @@ def read_tasks(sheets_service):
     try:
         result = sheets_service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
-            range='Tasks!A2:Q'  # All columns, starting from row 2
+            range='Tasks!A2:Q'
         ).execute()
         
         rows = result.get('values', [])
         
-        # Parse into task objects
         tasks = []
         for row in rows:
-            # Pad row to ensure we have all 17 columns
             row = row + [''] * (17 - len(row))
             
             task = {
@@ -74,23 +77,19 @@ def read_tasks(sheets_service):
 def generate_brief(tasks):
     """Generate the daily brief from tasks"""
     
-    # Get current date
     now = datetime.now()
     date_str = now.strftime("%A, %B %d, %Y")
     
-    # Filter tasks
     open_tasks = [t for t in tasks if t['status'] == 'open']
     high_priority = [t for t in open_tasks if t['priority'] == 'high']
     medium_priority = [t for t in open_tasks if t['priority'] == 'medium']
     
-    # Build the brief
     brief = []
     brief.append("=" * 60)
     brief.append(f"📅 DAILY BRIEF - {date_str}")
     brief.append("=" * 60)
     brief.append("")
     
-    # Top Tasks Section
     brief.append("🎯 TOP TASKS")
     brief.append("")
     
@@ -103,7 +102,7 @@ def generate_brief(tasks):
     
     if medium_priority:
         brief.append("Medium Priority:")
-        for i, task in enumerate(medium_priority[:3], 1):  # Show max 3
+        for i, task in enumerate(medium_priority[:3], 1):
             person = f" (from {task['linked_person']})" if task['linked_person'] else ""
             brief.append(f"  {i}. {task['title']}{person}")
         brief.append("")
@@ -112,7 +111,6 @@ def generate_brief(tasks):
         brief.append("  ✅ No open tasks! You're all caught up.")
         brief.append("")
     
-    # Summary Stats
     brief.append("📊 SUMMARY")
     brief.append("")
     brief.append(f"  • Total open tasks: {len(open_tasks)}")
@@ -120,7 +118,6 @@ def generate_brief(tasks):
     brief.append(f"  • Medium priority: {len(medium_priority)}")
     brief.append("")
     
-    # Tasks by Person
     people = {}
     for task in open_tasks:
         person = task['linked_person'] or 'Unknown'
@@ -128,7 +125,7 @@ def generate_brief(tasks):
             people[person] = []
         people[person].append(task['title'])
     
-    if len(people) > 1:  # Only show if multiple people
+    if len(people) > 1:
         brief.append("👥 TASKS BY PERSON")
         brief.append("")
         for person, task_list in sorted(people.items()):
@@ -136,7 +133,6 @@ def generate_brief(tasks):
                 brief.append(f"  • {person}: {len(task_list)} task(s)")
         brief.append("")
     
-    # Footer
     brief.append("=" * 60)
     brief.append("💡 View full sheet:")
     brief.append(f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}")
@@ -144,32 +140,67 @@ def generate_brief(tasks):
     
     return "\n".join(brief)
 
+def send_email(brief_text):
+    """Send the daily brief via email"""
+    
+    if not GMAIL_APP_PASSWORD:
+        print("⚠️  No Gmail app password configured - skipping email")
+        return False
+    
+    try:
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"Daily Brief - {datetime.now().strftime('%A, %B %d, %Y')}"
+        msg['From'] = GMAIL_ADDRESS
+        msg['To'] = GMAIL_ADDRESS
+        
+        # Plain text version
+        text_part = MIMEText(brief_text, 'plain')
+        msg.attach(text_part)
+        
+        # Send via Gmail SMTP
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
+            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        
+        print(f"✅ Email sent to {GMAIL_ADDRESS}")
+        return True
+    
+    except Exception as e:
+        print(f"❌ Error sending email: {e}")
+        return False
+
 def main():
     """Main execution"""
     
-    # Check environment variables
     if not all([SPREADSHEET_ID, SERVICE_ACCOUNT_FILE]):
         print("❌ Missing required environment variables")
         sys.exit(1)
     
     try:
-        # Get Sheets service
         sheets = get_sheets_service()
         
-        # Read tasks
         print("📖 Reading tasks from Google Sheets...")
         tasks = read_tasks(sheets)
         
         if not tasks:
             print("⚠️  No tasks found in sheet")
-            print("\n📧 DAILY BRIEF - No tasks to show")
+            brief_text = f"\n📧 DAILY BRIEF - {datetime.now().strftime('%A, %B %d, %Y')}\n\n✅ No tasks to show\n"
+            print(brief_text)
+            if GMAIL_APP_PASSWORD:
+                send_email(brief_text)
             return
         
         print(f"✅ Found {len(tasks)} total tasks\n")
         
-        # Generate and display brief
-        brief = generate_brief(tasks)
-        print(brief)
+        brief_text = generate_brief(tasks)
+        print(brief_text)
+        
+        # Send email if configured
+        if GMAIL_APP_PASSWORD:
+            print("\n📧 Sending email...")
+            send_email(brief_text)
+        else:
+            print("\n⚠️  Email not configured (missing GMAIL_APP_PASSWORD)")
     
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
