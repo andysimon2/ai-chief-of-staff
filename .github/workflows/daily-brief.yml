@@ -2,38 +2,55 @@ name: Daily Brief
 
 on:
   schedule:
-    - cron: '0 12 * * 1-5'  # 7am EST weekdays (12pm UTC)
-  workflow_dispatch:
+    # Run at 6:45 AM EST (11:45 UTC) every weekday
+    - cron: '45 11 * * 1-5'
+  workflow_dispatch: # Allow manual trigger
 
 jobs:
-  generate-brief:
+  daily-brief:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-      
-      - name: Install dependencies
-        run: |
-          pip install google-api-python-client google-auth anthropic python-dotenv
-      
-      - name: Create credentials file
-        run: |
-          mkdir -p credentials
-          echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > credentials/service-account.json
-      
-      - name: Create .env file
-        run: |
-          echo "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID }}" > .env
-          echo "SERVICE_ACCOUNT_FILE=credentials/service-account.json" >> .env
-          echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}" >> .env
-          echo "GMAIL_ADDRESS=asimon13@binghamton.edu" >> .env
-          echo "GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}" >> .env
-      
-      - name: Generate and Email Daily Brief
-        run: python3 scripts/daily_brief.py
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install --break-system-packages google-auth-oauthlib google-auth-httplib2 google-api-python-client anthropic python-dotenv
+    
+    - name: Create .env file
+      run: |
+        echo "SPREADSHEET_ID=${{ secrets.SPREADSHEET_ID }}" >> .env
+        echo "ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}" >> .env
+        echo "GMAIL_USER=${{ secrets.GMAIL_USER }}" >> .env
+        echo "GMAIL_APP_PASSWORD=${{ secrets.GMAIL_APP_PASSWORD }}" >> .env
+        echo "SERVICE_ACCOUNT_FILE=credentials/service-account.json" >> .env
+    
+    - name: Create credentials directory
+      run: mkdir -p credentials
+    
+    - name: Write service account credentials
+      run: echo '${{ secrets.SERVICE_ACCOUNT_JSON }}' > credentials/service-account.json
+    
+    - name: Write Gmail credentials
+      run: echo '${{ secrets.GMAIL_CREDENTIALS_JSON }}' > credentials/gmail_credentials.json
+    
+    - name: Write Gmail token
+      run: echo '${{ secrets.GMAIL_TOKEN_PICKLE }}' | base64 -d > credentials/gmail_token.pickle
+    
+    - name: Write Calendar token
+      run: echo '${{ secrets.CALENDAR_TOKEN_PICKLE }}' | base64 -d > credentials/calendar_token.pickle
+    
+    - name: Sync Gmail (get last 24h emails)
+      run: python3 scripts/gmail_to_tasks.py
+    
+    - name: Sync Calendar (get today's meetings)
+      run: python3 scripts/calendar_sync.py
+    
+    - name: Generate and send daily brief
+      run: python3 scripts/daily_brief.py
