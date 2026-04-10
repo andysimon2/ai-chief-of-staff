@@ -1,215 +1,279 @@
 #!/usr/bin/env python3
 """
-Gmail to Tasks Extractor - SIMPLIFIED VERSION
-Since Gmail requires domain-wide delegation (complex setup), this version:
-1. Manually creates sample tasks to test the system
-2. Writes them to Google Sheets
-3. Verifies the full pipeline works
-
-Once this works, we can add Gmail integration later.
+Extract tasks and WaitingOn items from Gmail
 """
 
 import os
 import sys
-from datetime import datetime
-from dotenv import load_dotenv
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from anthropic import Anthropic
 import json
+import pickle
+import base64
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as sheets_build
+import anthropic
 
-# Load environment variables
+# Load environment
 load_dotenv()
 
-# Configuration
+GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+SHEETS_SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE')
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
 
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+def authenticate_gmail():
+    """Authenticate with Gmail API"""
+    creds = None
+    token_path = 'credentials/gmail_token.pickle'
+    
+    if os.path.exists(token_path):
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+    
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                'credentials/gmail_credentials.json', GMAIL_SCOPES)
+            creds = flow.run_local_server(port=0)
+        
+        with open(token_path, 'wb') as token:
+            pickle.dump(creds, token)
+    
+    return build('gmail', 'v1', credentials=creds)
 
 def get_sheets_service():
     """Authenticate and return Sheets service"""
-    print("🔐 Authenticating with Sheets API...")
-    
     credentials = service_account.Credentials.from_service_account_file(
         SERVICE_ACCOUNT_FILE,
-        scopes=SCOPES
+        scopes=SHEETS_SCOPES
     )
-    
-    service = build('sheets', 'v4', credentials=credentials)
-    print("✅ Sheets authentication successful")
-    return service
+    return sheets_build('sheets', 'v4', credentials=credentials)
 
-def create_sample_tasks():
-    """Create sample tasks for testing"""
-    print("\n📋 Creating sample tasks...")
+def get_emails_last_24h(service):
+    """Fetch emails from last 24 hours"""
+    yesterday = datetime.now() - timedelta(days=1)
+    query = f'after:{int(yesterday.timestamp())}'
     
-    sample_emails = [
-        {
-            'subject': 'Q4 Planning Meeting Prep',
-            'sender': 'sarah.chen@company.com',
-            'body': 'Hi Andrew, can you please review the Q4 deck and send me your feedback by Friday? Also, we need to schedule a follow-up for next week.'
-        },
-        {
-            'subject': 'LP Introduction Request',
-            'sender': 'john.davis@vc.com',
-            'body': 'Andrew, could you intro me to Maria at Benchmark? I think there could be good synergy there. Let me know if you need context.'
-        },
-        {
-            'subject': 'Cohort Progress Check',
-            'sender': 'alex.rodriguez@startup.com',
-            'body': 'Quick update needed on our progress. Can we grab 30min this week to discuss the metrics dashboard?'
-        }
-    ]
+    print(f"📧 Fetching emails from last 24 hours...")
     
-    return sample_emails
+    results = service.users().messages().list(
+        userId='me',
+        q=query,
+        maxResults=100
+    ).execute()
+    
+    messages = results.get('messages', [])
+    print(f"✅ Found {len(messages)} emails")
+    
+    emails = []
+    for msg in messages:
+        message = service.users().messages().get(
+            userId='me',
+            id=msg['id'],
+            format='full'
+        ).execute()
+        
+        # Extract headers
+        headers = {h['name']: h['value'] for h in message['payload']['headers']}
+        
+        # Extract body
+        body = ""
+        if 'parts' in message['payload']:
+            for part in message['payload']['parts']:
+                if part['mimeType'] == 'text/plain' and 'data' in part['body']:
+                    body = base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+                    break
+        elif 'body' in message['payload'] and 'data' in message['payload']['body']:
+            body = base64.urlsafe_b64decode(message['payload']['body']['data']).decode('utf-8')
+        
+        emails.append({
+            'id': msg['id'],
+            'from': headers.get('From', ''),
+            'subject': headers.get('Subject', ''),
+            'date': headers.get('Date', ''),
+            'body': body[:2000]  # Limit to first 2000 chars
+        })
+    
+    return emails
 
 def extract_tasks_with_claude(emails):
-    """Use Claude to extract tasks from sample emails"""
-    print("\n🤖 Using Claude to extract tasks...")
+    """Use Claude to extract tasks and WaitingOn items"""
     
-    client = Anthropic(api_key=ANTHROPIC_API_KEY)
+    if not emails:
+        return {'tasks': [], 'waiting_on': []}
     
-    # Prepare email context
-    email_context = "\n\n".join([
-        f"Email {i+1}:\nFrom: {e['sender']}\nSubject: {e['subject']}\nBody: {e['body']}"
-        for i, e in enumerate(emails)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    
+    # Prepare email summary
+    email_text = "\n\n".join([
+        f"From: {e['from']}\nSubject: {e['subject']}\nDate: {e['date']}\n\n{e['body']}"
+        for e in emails[:20]  # Limit to 20 most recent
     ])
     
-    prompt = f"""You are analyzing emails to extract actionable tasks. 
+    prompt = f"""Analyze these emails and extract:
+1. TASKS - things I need to do
+2. WAITING_ON - things others committed to send me
 
-EMAILS:
-{email_context}
+For each task:
+- title: brief description
+- description: more detail if available
+- linked_person: who it's related to
+- priority: high/medium/low (default: medium)
+- source_confidence: 0.0-1.0 based on clarity
 
-Extract all tasks that need to be done. For each task, return JSON in this exact format:
+For each waiting_on:
+- description: what they owe me
+- person: who owes it
+- source_confidence: 0.0-1.0 based on clarity
+
+Return ONLY valid JSON with this structure:
 {{
   "tasks": [
-    {{
-      "title": "Brief description of task",
-      "description": "More details if available",
-      "priority": "medium",
-      "source": "email",
-      "linked_person": "Name of person if relevant"
-    }}
+    {{"title": "...", "description": "...", "linked_person": "...", "priority": "medium", "source_confidence": 0.8}}
+  ],
+  "waiting_on": [
+    {{"description": "...", "person": "...", "source_confidence": 0.9}}
   ]
 }}
 
-Rules:
-- Only extract clear, actionable tasks
-- Default priority to "medium"
-- If no tasks found, return empty array
-
-Return ONLY the JSON, no other text."""
-
+EMAILS:
+{email_text}
+"""
+    
+    print("\n🤖 Using Claude to extract tasks and waiting_on items...")
+    
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=4000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    
+    # Parse response
+    response_text = response.content[0].text
+    
+    # Extract JSON from response
     try:
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        # Parse response
-        content = response.content[0].text
-        tasks_data = json.loads(content)
-        tasks = tasks_data.get('tasks', [])
-        
-        print(f"✅ Extracted {len(tasks)} tasks")
-        return tasks
+        # Try to find JSON in the response
+        start = response_text.find('{')
+        end = response_text.rfind('}') + 1
+        json_str = response_text[start:end]
+        result = json.loads(json_str)
+    except:
+        print("⚠️  Could not parse Claude response as JSON")
+        result = {'tasks': [], 'waiting_on': []}
     
-    except Exception as e:
-        print(f"❌ Error with Claude API: {e}")
-        return []
+    print(f"✅ Extracted {len(result.get('tasks', []))} tasks and {len(result.get('waiting_on', []))} waiting_on items")
+    
+    return result
 
-def write_tasks_to_sheet(sheets_service, tasks):
-    """Write extracted tasks to Google Sheet"""
-    print("\n📝 Writing tasks to Google Sheet...")
+def write_to_sheets(sheets_service, data):
+    """Write tasks and waiting_on to Google Sheets"""
     
-    if not tasks:
-        print("⚠️  No tasks to write")
-        return
-    
-    # Prepare rows for sheet
-    rows = []
     timestamp = datetime.now().isoformat()
     
-    for i, task in enumerate(tasks):
-        row = [
-            f"task_{timestamp}_{i}",  # id
-            task.get('title', ''),  # title
-            task.get('description', ''),  # description
-            'you',  # primary_owner
-            '',  # collaborators
-            'solo',  # collaboration_type
-            'open',  # status
-            task.get('priority', 'medium'),  # priority
-            '',  # due_date
-            task.get('source', 'email'),  # source
-            '0.8',  # source_confidence
-            task.get('linked_person', ''),  # linked_person
-            '',  # linked_meeting
-            timestamp,  # created_at
-            timestamp,  # updated_at
-            'false',  # duplicate_flag
-            ''  # potential_duplicates
-        ]
-        rows.append(row)
-    
-    try:
-        # Append to Tasks sheet
+    # Write tasks
+    if data['tasks']:
+        print(f"\n📝 Writing {len(data['tasks'])} tasks to Google Sheets...")
+        
+        task_rows = []
+        for i, task in enumerate(data['tasks'], 1):
+            task_id = f"EMAIL_{timestamp}_{i}"
+            task_rows.append([
+                task_id,
+                task.get('title', ''),
+                task.get('description', ''),
+                'you',  # primary_owner
+                '',  # collaborators
+                'solo',  # collaboration_type
+                'open',  # status
+                task.get('priority', 'medium'),
+                '',  # due_date
+                'email',  # source
+                str(task.get('source_confidence', 0.7)),
+                task.get('linked_person', ''),
+                '',  # linked_meeting
+                timestamp,  # created_at
+                timestamp,  # updated_at
+                'FALSE',  # duplicate_flag
+                ''  # potential_duplicates
+            ])
+        
         sheets_service.spreadsheets().values().append(
             spreadsheetId=SPREADSHEET_ID,
-            range='Tasks!A2',  # Start at row 2 (after headers)
+            range='Tasks!A:Q',
             valueInputOption='RAW',
-            body={'values': rows}
+            body={'values': task_rows}
         ).execute()
         
-        print(f"✅ Wrote {len(rows)} tasks to Google Sheet")
+        print(f"✅ Wrote {len(task_rows)} tasks")
     
-    except Exception as e:
-        print(f"❌ Error writing to sheet: {e}")
-        import traceback
-        traceback.print_exc()
+    # Write waiting_on
+    if data['waiting_on']:
+        print(f"\n⏳ Writing {len(data['waiting_on'])} waiting_on items to Google Sheets...")
+        
+        waiting_rows = []
+        for i, item in enumerate(data['waiting_on'], 1):
+            waiting_id = f"WAIT_{timestamp}_{i}"
+            waiting_rows.append([
+                waiting_id,
+                item.get('description', ''),
+                item.get('person', ''),
+                '',  # related_task
+                'email',  # source
+                str(item.get('source_confidence', 0.7)),
+                timestamp,  # last_activity_date
+                'waiting',  # status
+                '',  # completed_at
+                '',  # completion_note
+                'FALSE',  # deliverable_matched
+                '0',  # days_waiting (will be calculated)
+                'FALSE'  # escalation_flag
+            ])
+        
+        sheets_service.spreadsheets().values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range='WaitingOn!A:M',
+            valueInputOption='RAW',
+            body={'values': waiting_rows}
+        ).execute()
+        
+        print(f"✅ Wrote {len(waiting_rows)} waiting_on items")
 
 def main():
     """Main execution"""
+    
     print("=" * 60)
-    print("🚀 AI CHIEF OF STAFF - Sample Task Extraction")
+    print("📧 GMAIL → TASKS EXTRACTION")
     print("=" * 60)
     
-    # Check environment variables
-    if not all([SPREADSHEET_ID, SERVICE_ACCOUNT_FILE, ANTHROPIC_API_KEY]):
-        print("❌ Missing required environment variables in .env file")
-        print("Required: SPREADSHEET_ID, SERVICE_ACCOUNT_FILE, ANTHROPIC_API_KEY")
-        sys.exit(1)
+    # Authenticate
+    gmail_service = authenticate_gmail()
+    sheets_service = get_sheets_service()
     
-    try:
-        # Get Sheets service
-        sheets = get_sheets_service()
-        
-        # Create sample emails (simulating Gmail fetch)
-        emails = create_sample_tasks()
-        print(f"✅ Created {len(emails)} sample emails")
-        
-        # Extract tasks using Claude
-        tasks = extract_tasks_with_claude(emails)
-        
-        # Write to sheet
-        write_tasks_to_sheet(sheets, tasks)
-        
-        print("\n" + "=" * 60)
-        print("✅ COMPLETE! Check your Google Sheet:")
-        print(f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}")
-        print("=" * 60)
-        print("\n💡 Next steps:")
-        print("1. Open the Google Sheet and verify tasks were added")
-        print("2. Once this works, we can add real Gmail integration")
+    # Fetch emails
+    emails = get_emails_last_24h(gmail_service)
     
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    if not emails:
+        print("\n✅ No emails in last 24 hours")
+        return
+    
+    # Extract tasks
+    extracted = extract_tasks_with_claude(emails)
+    
+    # Write to sheets
+    write_to_sheets(sheets_service, extracted)
+    
+    print("\n" + "=" * 60)
+    print("✅ COMPLETE!")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()

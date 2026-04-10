@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 """
-Daily Brief Generator with Email Delivery
-Reads tasks from Google Sheets and emails daily brief
+Generate and email enhanced daily brief
 """
 
 import os
-import sys
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-# Load environment variables
+# Load environment
 load_dotenv()
 
-# Configuration
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 SERVICE_ACCOUNT_FILE = os.getenv('SERVICE_ACCOUNT_FILE')
-GMAIL_ADDRESS = os.getenv('GMAIL_ADDRESS')
+GMAIL_USER = os.getenv('GMAIL_USER')
 GMAIL_APP_PASSWORD = os.getenv('GMAIL_APP_PASSWORD')
-
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets.readonly']
 
 def get_sheets_service():
@@ -33,180 +29,212 @@ def get_sheets_service():
     )
     return build('sheets', 'v4', credentials=credentials)
 
-def read_tasks(sheets_service):
-    """Read all tasks from the Tasks sheet"""
-    try:
-        result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=SPREADSHEET_ID,
-            range='Tasks!A2:Q'
-        ).execute()
-        
-        rows = result.get('values', [])
-        
-        tasks = []
-        for row in rows:
-            row = row + [''] * (17 - len(row))
-            
-            task = {
-                'id': row[0],
-                'title': row[1],
-                'description': row[2],
-                'primary_owner': row[3],
-                'collaborators': row[4],
-                'collaboration_type': row[5],
-                'status': row[6],
-                'priority': row[7],
-                'due_date': row[8],
-                'source': row[9],
-                'source_confidence': row[10],
-                'linked_person': row[11],
-                'linked_meeting': row[12],
-                'created_at': row[13],
-                'updated_at': row[14],
-                'duplicate_flag': row[15],
-                'potential_duplicates': row[16]
-            }
-            tasks.append(task)
-        
-        return tasks
+def get_todays_meetings(service):
+    """Get today's meetings from Meetings tab"""
     
-    except Exception as e:
-        print(f"❌ Error reading tasks: {e}")
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Meetings!A:K'
+    ).execute()
+    
+    rows = result.get('values', [])
+    
+    if len(rows) <= 1:
         return []
+    
+    # Parse meetings
+    meetings = []
+    headers = rows[0]
+    
+    for row in rows[1:]:
+        if len(row) >= 4:
+            try:
+                # Parse datetime
+                meeting_datetime = datetime.fromisoformat(row[2].replace('Z', '+00:00'))
+                
+                # Check if today
+                today = datetime.now().date()
+                if meeting_datetime.date() == today:
+                    meetings.append({
+                        'time': meeting_datetime.strftime('%I:%M %p').lstrip('0'),
+                        'title': row[1],
+                        'attendees': row[3] if len(row) > 3 else '',
+                        'summary': row[4] if len(row) > 4 else ''
+                    })
+            except:
+                continue
+    
+    # Sort by time
+    meetings.sort(key=lambda x: x['time'])
+    
+    return meetings
 
-def generate_brief(tasks):
-    """Generate the daily brief from tasks"""
+def get_high_priority_tasks(service):
+    """Get high priority tasks"""
     
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='Tasks!A:Q'
+    ).execute()
+    
+    rows = result.get('values', [])
+    
+    if len(rows) <= 1:
+        return []
+    
+    tasks = []
+    for row in rows[1:]:
+        if len(row) >= 8:
+            status = row[6] if len(row) > 6 else ''
+            priority = row[7] if len(row) > 7 else 'medium'
+            
+            # Only include open, high priority tasks
+            if status == 'open' and priority == 'high':
+                tasks.append({
+                    'title': row[1],
+                    'description': row[2] if len(row) > 2 else ''
+                })
+    
+    return tasks[:3]  # Max 3 tasks
+
+def get_critical_waiting_on(service):
+    """Get waiting_on items >7 days"""
+    
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range='WaitingOn!A:M'
+    ).execute()
+    
+    rows = result.get('values', [])
+    
+    if len(rows) <= 1:
+        return []
+    
+    critical_items = []
     now = datetime.now()
-    date_str = now.strftime("%A, %B %d, %Y")
     
-    open_tasks = [t for t in tasks if t['status'] == 'open']
-    high_priority = [t for t in open_tasks if t['priority'] == 'high']
-    medium_priority = [t for t in open_tasks if t['priority'] == 'medium']
+    for row in rows[1:]:
+        if len(row) >= 7:
+            status = row[7] if len(row) > 7 else 'waiting'
+            
+            if status == 'waiting':
+                try:
+                    # Calculate days waiting
+                    last_activity = datetime.fromisoformat(row[6].replace('Z', '+00:00'))
+                    days_waiting = (now - last_activity).days
+                    
+                    if days_waiting >= 7:
+                        critical_items.append({
+                            'person': row[2],
+                            'description': row[1],
+                            'days': days_waiting
+                        })
+                except:
+                    continue
     
-    brief = []
-    brief.append("=" * 60)
-    brief.append(f"📅 DAILY BRIEF - {date_str}")
-    brief.append("=" * 60)
-    brief.append("")
+    # Sort by days (most overdue first)
+    critical_items.sort(key=lambda x: x['days'], reverse=True)
     
-    brief.append("🎯 TOP TASKS")
-    brief.append("")
+    return critical_items
+
+def generate_brief(meetings, tasks, waiting_on):
+    """Generate the brief text"""
     
-    if high_priority:
-        brief.append("High Priority:")
-        for i, task in enumerate(high_priority, 1):
-            person = f" (from {task['linked_person']})" if task['linked_person'] else ""
-            brief.append(f"  {i}. {task['title']}{person}")
-        brief.append("")
+    today = datetime.now()
+    date_str = today.strftime('%A, %B %d, %Y')
     
-    if medium_priority:
-        brief.append("Medium Priority:")
-        for i, task in enumerate(medium_priority[:3], 1):
-            person = f" (from {task['linked_person']})" if task['linked_person'] else ""
-            brief.append(f"  {i}. {task['title']}{person}")
-        brief.append("")
+    brief = f"""TODAY - {date_str}
+
+📅 Meetings
+"""
     
-    if not high_priority and not medium_priority:
-        brief.append("  ✅ No open tasks! You're all caught up.")
-        brief.append("")
+    if meetings:
+        for m in meetings:
+            attendees_short = m['attendees'].split(',')[0] if m['attendees'] else 'No attendees'
+            brief += f"- {m['time']}: {m['title']} ({attendees_short.strip()})\n"
+    else:
+        brief += "- No meetings scheduled\n"
     
-    brief.append("📊 SUMMARY")
-    brief.append("")
-    brief.append(f"  • Total open tasks: {len(open_tasks)}")
-    brief.append(f"  • High priority: {len(high_priority)}")
-    brief.append(f"  • Medium priority: {len(medium_priority)}")
-    brief.append("")
+    brief += "\n🎯 Top Tasks (High Priority Only)\n"
     
-    people = {}
-    for task in open_tasks:
-        person = task['linked_person'] or 'Unknown'
-        if person not in people:
-            people[person] = []
-        people[person].append(task['title'])
+    if tasks:
+        for i, task in enumerate(tasks, 1):
+            brief += f"{i}. {task['title']}\n"
+    else:
+        brief += "- No high priority tasks\n"
     
-    if len(people) > 1:
-        brief.append("👥 TASKS BY PERSON")
-        brief.append("")
-        for person, task_list in sorted(people.items()):
-            if person != 'Unknown':
-                brief.append(f"  • {person}: {len(task_list)} task(s)")
-        brief.append("")
+    brief += "\n⏳ Waiting On (Critical - >7 days)\n"
     
-    brief.append("=" * 60)
-    brief.append("💡 View full sheet:")
-    brief.append(f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}")
-    brief.append("=" * 60)
+    if waiting_on:
+        for item in waiting_on:
+            brief += f"- {item['person']}: {item['description']} ({item['days']} days)\n"
+    else:
+        brief += "- Nothing overdue\n"
     
-    return "\n".join(brief)
+    brief += "\n---\n\n✅ Have a productive day!\n"
+    
+    return brief
 
 def send_email(brief_text):
-    """Send the daily brief via email"""
+    """Send brief via email"""
     
-    if not GMAIL_APP_PASSWORD:
-        print("⚠️  No Gmail app password configured - skipping email")
-        return False
+    msg = MIMEMultipart()
+    msg['From'] = GMAIL_USER
+    msg['To'] = GMAIL_USER
+    msg['Subject'] = f"Daily Brief - {datetime.now().strftime('%A, %B %d')}"
+    
+    msg.attach(MIMEText(brief_text, 'plain'))
     
     try:
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = f"Daily Brief - {datetime.now().strftime('%A, %B %d, %Y')}"
-        msg['From'] = GMAIL_ADDRESS
-        msg['To'] = GMAIL_ADDRESS
-        
-        # Plain text version
-        text_part = MIMEText(brief_text, 'plain')
-        msg.attach(text_part)
-        
-        # Send via Gmail SMTP
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        
-        print(f"✅ Email sent to {GMAIL_ADDRESS}")
-        return True
-    
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("✅ Email sent successfully!")
     except Exception as e:
         print(f"❌ Error sending email: {e}")
-        return False
 
 def main():
     """Main execution"""
     
-    if not all([SPREADSHEET_ID, SERVICE_ACCOUNT_FILE]):
-        print("❌ Missing required environment variables")
-        sys.exit(1)
+    print("=" * 60)
+    print("📧 GENERATING DAILY BRIEF")
+    print("=" * 60)
     
-    try:
-        sheets = get_sheets_service()
-        
-        print("📖 Reading tasks from Google Sheets...")
-        tasks = read_tasks(sheets)
-        
-        if not tasks:
-            print("⚠️  No tasks found in sheet")
-            brief_text = f"\n📧 DAILY BRIEF - {datetime.now().strftime('%A, %B %d, %Y')}\n\n✅ No tasks to show\n"
-            print(brief_text)
-            if GMAIL_APP_PASSWORD:
-                send_email(brief_text)
-            return
-        
-        print(f"✅ Found {len(tasks)} total tasks\n")
-        
-        brief_text = generate_brief(tasks)
-        print(brief_text)
-        
-        # Send email if configured
-        if GMAIL_APP_PASSWORD:
-            print("\n📧 Sending email...")
-            send_email(brief_text)
-        else:
-            print("\n⚠️  Email not configured (missing GMAIL_APP_PASSWORD)")
+    # Get Sheets service
+    service = get_sheets_service()
     
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    # Gather data
+    print("\n📅 Fetching today's meetings...")
+    meetings = get_todays_meetings(service)
+    print(f"   Found {len(meetings)} meetings")
+    
+    print("\n🎯 Fetching high priority tasks...")
+    tasks = get_high_priority_tasks(service)
+    print(f"   Found {len(tasks)} high priority tasks")
+    
+    print("\n⏳ Fetching critical waiting_on items...")
+    waiting_on = get_critical_waiting_on(service)
+    print(f"   Found {len(waiting_on)} items >7 days")
+    
+    # Generate brief
+    print("\n✍️  Generating brief...")
+    brief = generate_brief(meetings, tasks, waiting_on)
+    
+    print("\n" + "=" * 60)
+    print("PREVIEW:")
+    print("=" * 60)
+    print(brief)
+    print("=" * 60)
+    
+    # Send email
+    print("\n📧 Sending email...")
+    send_email(brief)
+    
+    print("\n" + "=" * 60)
+    print("✅ COMPLETE!")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()
